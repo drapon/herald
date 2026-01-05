@@ -8,6 +8,7 @@ pub mod directory;
 pub mod error;
 pub mod logging;
 pub mod ports;
+pub mod retention;
 pub mod scheduler;
 
 // Re-export primary types for convenient access
@@ -18,6 +19,7 @@ pub use config::{
 pub use directory::DirectoryManager;
 pub use error::{AIError, CaptureError, ConfigError, HeraldError, StorageError};
 pub use logging::{init_logger, LogLevel, LoggerConfig, LoggerError, LoggerGuard};
+pub use retention::{cleanup_once, CleanupSummary, RetentionError, RetentionManager};
 pub use scheduler::{capture_once, CaptureResult, CaptureScheduler, SchedulerError};
 
 #[cfg(test)]
