@@ -266,6 +266,83 @@ where
     }
 }
 
+/// Performs a single capture without requiring a scheduler instance
+///
+/// This is a convenience function for one-shot captures, such as the
+/// `herald capture` CLI command. It works independently of any running
+/// scheduler and does not affect periodic capture timing.
+///
+/// # Arguments
+/// * `capture_port` - The capture port implementation
+/// * `storage_port` - The storage port implementation
+/// * `config` - Application configuration
+///
+/// # Returns
+/// `CaptureResult` containing the file path, timestamp, and size
+///
+/// # Example
+/// ```ignore
+/// let result = capture_once(&capture_port, &storage_port, &config).await?;
+/// println!("Captured: {} at {}", result.file_path.display(), result.timestamp);
+/// ```
+pub async fn capture_once<C, S>(
+    capture_port: &C,
+    storage_port: &S,
+    config: &Config,
+) -> Result<CaptureResult, SchedulerError>
+where
+    C: CapturePort,
+    S: StoragePort,
+{
+    let start = std::time::Instant::now();
+    debug!("Starting manual capture...");
+
+    // Capture screen
+    let image = capture_port.capture_screen().await?;
+    debug!("Screen captured in {:?}", start.elapsed());
+
+    // Generate filename with timestamp
+    let timestamp = image.timestamp;
+    let datetime = chrono_format_timestamp(timestamp);
+    let filename = format!("{}.png", datetime);
+
+    // Determine save path
+    let captures_dir = config.storage.data_dir.join("captures");
+    let file_path = captures_dir.join(&filename);
+
+    // Ensure captures directory exists
+    fs::create_dir_all(&captures_dir).await?;
+
+    // Save image file
+    fs::write(&file_path, &image.data).await?;
+    let size_bytes = image.data.len() as u64;
+    debug!("Image saved to {:?}", file_path);
+
+    // Save metadata to database
+    let metadata = CaptureMetadata {
+        id: None,
+        timestamp,
+        file_path: file_path.to_string_lossy().to_string(),
+        created_at: timestamp,
+    };
+    storage_port.save_metadata(metadata).await?;
+    debug!("Metadata saved to database");
+
+    let elapsed = start.elapsed();
+    info!(
+        "Manual capture completed: {} ({} bytes) in {:?}",
+        file_path.display(),
+        size_bytes,
+        elapsed
+    );
+
+    Ok(CaptureResult {
+        file_path,
+        timestamp,
+        size_bytes,
+    })
+}
+
 /// Format Unix timestamp as YYYY-MM-DD_HH-mm-ss (UTC)
 fn chrono_format_timestamp(timestamp: i64) -> String {
     // Convert to UTC time components
@@ -704,5 +781,146 @@ mod tests {
     fn test_scheduler_error_from_storage_error() {
         let err: SchedulerError = StorageError::DatabaseError("test".to_string()).into();
         assert!(matches!(err, SchedulerError::StorageError(_)));
+    }
+
+    // === Task 8.1 Tests: Manual Capture ===
+
+    #[tokio::test]
+    async fn test_capture_once_standalone_function() {
+        // Test that capture_once works independently without scheduler
+        let capture = Arc::new(MockCapturePort::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let config = Arc::new(create_test_config(60));
+
+        let result = capture_once(&*capture, &*storage, &config).await;
+        assert!(result.is_ok());
+
+        let capture_result = result.unwrap();
+        assert!(capture_result.file_path.exists());
+        assert!(capture_result.timestamp > 0);
+        assert!(capture_result.size_bytes > 0);
+        assert_eq!(storage.saved_count(), 1);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&capture_result.file_path);
+    }
+
+    #[tokio::test]
+    async fn test_capture_once_returns_correct_path_and_timestamp() {
+        // Verify that manual capture returns file path and timestamp correctly
+        let capture = Arc::new(MockCapturePort::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let config = Arc::new(create_test_config(60));
+
+        let before_capture = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let result = capture_once(&*capture, &*storage, &config).await.unwrap();
+
+        let after_capture = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Timestamp should be within the capture window
+        assert!(result.timestamp >= before_capture);
+        assert!(result.timestamp <= after_capture);
+
+        // Path should be in the captures directory
+        assert!(result.file_path.to_string_lossy().contains("captures"));
+        assert!(result.file_path.extension().map_or(false, |e| e == "png"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&result.file_path);
+    }
+
+    #[tokio::test]
+    async fn test_manual_capture_independent_of_scheduler_state() {
+        // Manual capture should work regardless of scheduler running state
+        let capture = Arc::new(MockCapturePort::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let config = Arc::new(create_test_config(60));
+
+        // Capture before scheduler exists
+        let result1 = capture_once(&*capture, &*storage, &config).await;
+        assert!(result1.is_ok());
+
+        // Create scheduler but don't start it
+        let scheduler = CaptureScheduler::new(
+            Arc::clone(&capture),
+            Arc::clone(&storage),
+            Arc::clone(&config),
+        );
+        assert!(!scheduler.is_running());
+
+        // Capture with scheduler not running
+        let result2 = capture_once(&*capture, &*storage, &config).await;
+        assert!(result2.is_ok());
+
+        // Start scheduler
+        scheduler.start().await.unwrap();
+        assert!(scheduler.is_running());
+
+        // Capture with scheduler running
+        let result3 = capture_once(&*capture, &*storage, &config).await;
+        assert!(result3.is_ok());
+
+        // All three captures should have succeeded
+        assert_eq!(capture.capture_count(), 3);
+
+        // Cleanup
+        scheduler.stop().await.unwrap();
+        let _ = std::fs::remove_file(&result1.unwrap().file_path);
+        let _ = std::fs::remove_file(&result2.unwrap().file_path);
+        let _ = std::fs::remove_file(&result3.unwrap().file_path);
+    }
+
+    #[tokio::test]
+    async fn test_manual_capture_does_not_affect_scheduler_timing() {
+        // Manual capture should not reset or affect the periodic capture interval
+        let capture = Arc::new(MockCapturePort::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let config = Arc::new(create_test_config(1)); // 1 second interval
+
+        let scheduler = CaptureScheduler::new(
+            Arc::clone(&capture),
+            Arc::clone(&storage),
+            Arc::clone(&config),
+        );
+
+        // Start scheduler
+        scheduler.start().await.unwrap();
+
+        // Wait for first scheduled capture
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let count_after_first = capture.capture_count();
+        assert!(
+            count_after_first >= 1,
+            "Should have at least 1 scheduled capture"
+        );
+
+        // Do a manual capture
+        let manual_result = capture_once(&*capture, &*storage, &config).await;
+        assert!(manual_result.is_ok());
+        let count_after_manual = capture.capture_count();
+        assert_eq!(
+            count_after_manual,
+            count_after_first + 1,
+            "Manual capture should add exactly 1 to count"
+        );
+
+        // Wait for another scheduled capture - it should still happen on schedule
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let count_after_second = capture.capture_count();
+        assert!(
+            count_after_second >= count_after_manual + 1,
+            "Scheduler should continue normally after manual capture"
+        );
+
+        // Cleanup
+        scheduler.stop().await.unwrap();
+        let _ = std::fs::remove_file(&manual_result.unwrap().file_path);
     }
 }

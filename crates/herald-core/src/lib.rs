@@ -18,7 +18,7 @@ pub use config::{
 pub use directory::DirectoryManager;
 pub use error::{AIError, CaptureError, ConfigError, HeraldError, StorageError};
 pub use logging::{init_logger, LogLevel, LoggerConfig, LoggerError, LoggerGuard};
-pub use scheduler::{CaptureResult, CaptureScheduler, SchedulerError};
+pub use scheduler::{capture_once, CaptureResult, CaptureScheduler, SchedulerError};
 
 #[cfg(test)]
 mod tests {
