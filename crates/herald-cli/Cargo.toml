@@ -1,0 +1,34 @@
+[package]
+name = "herald-cli"
+description = "CLI application for Herald - AI-powered screen capture assistant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "herald"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+herald-core.workspace = true
+herald-adapters.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

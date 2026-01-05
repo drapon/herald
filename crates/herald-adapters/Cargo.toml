@@ -1,0 +1,43 @@
+[package]
+name = "herald-adapters"
+description = "Infrastructure adapters for Herald - ScreenCaptureKit, SQLite, AI providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Internal crates
+herald-core.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Async traits
+async-trait.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Database
+rusqlite.workspace = true
+tokio-rusqlite.workspace = true
+
+# Screen capture (macOS only)
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit.workspace = true
+image.workspace = true
+png.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"

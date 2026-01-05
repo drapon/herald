@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+# Note: Cargo.lock is committed for binary projects
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Herald data (user-specific)
+.herald/
+
+# Logs
+*.log
+
+# Build artifacts
+*.dSYM/
