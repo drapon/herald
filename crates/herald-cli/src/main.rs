@@ -5,6 +5,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod app;
 mod commands;
 
 /// Herald - AI-powered screen capture assistant for macOS
