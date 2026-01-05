@@ -299,6 +299,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dirs",
+ "libc",
  "serde",
  "tempfile",
  "thiserror 1.0.69",

@@ -4,6 +4,7 @@
 //! following the Hexagonal Architecture pattern.
 
 pub mod config;
+pub mod daemon;
 pub mod directory;
 pub mod error;
 pub mod logging;
@@ -16,6 +17,7 @@ pub use config::{
     get_default_config_path, load_config, load_config_from_path, AiConfig, CaptureConfig, Config,
     StorageConfig,
 };
+pub use daemon::{DaemonController, DaemonError, DaemonStartResult, PidManager, ShutdownSender};
 pub use directory::DirectoryManager;
 pub use error::{AIError, CaptureError, ConfigError, HeraldError, StorageError};
 pub use logging::{init_logger, LogLevel, LoggerConfig, LoggerError, LoggerGuard};
