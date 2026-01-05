@@ -19,6 +19,9 @@ herald-adapters.workspace = true
 # Async runtime
 tokio.workspace = true
 
+# CLI
+clap.workspace = true
+
 # Serialization
 serde.workspace = true
 
@@ -30,5 +33,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 
+# Utilities
+chrono.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
