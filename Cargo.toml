@@ -53,6 +53,12 @@ screencapturekit = "1.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.17"
 
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Base64 encoding
+base64 = "0.22"
+
 # Internal crates
 herald-core = { path = "crates/herald-core" }
 herald-adapters = { path = "crates/herald-adapters" }

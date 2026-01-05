@@ -8,6 +8,7 @@ pub mod capture;
 pub mod storage;
 
 // Re-export primary adapter types
+pub use ai::{ClaudeAdapter, GeminiAdapter};
 pub use storage::SqliteAdapter;
 
 #[cfg(target_os = "macos")]

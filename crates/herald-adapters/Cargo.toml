@@ -28,6 +28,12 @@ async-trait.workspace = true
 # Logging
 tracing.workspace = true
 
+# HTTP client
+reqwest.workspace = true
+
+# Base64 encoding
+base64.workspace = true
+
 # Database
 rusqlite.workspace = true
 tokio-rusqlite.workspace = true
