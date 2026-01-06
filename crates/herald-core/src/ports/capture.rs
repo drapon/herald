@@ -3,6 +3,17 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
+/// Information about an available display
+#[derive(Debug, Clone)]
+pub struct DisplayInfo {
+    /// Display index (0-based)
+    pub index: u32,
+    /// Display width in pixels
+    pub width: u32,
+    /// Display height in pixels
+    pub height: u32,
+}
+
 /// Result of a screen capture operation
 #[derive(Debug, Clone)]
 pub struct CapturedImage {
@@ -34,16 +45,44 @@ pub enum CaptureError {
     /// IO error during capture
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// Invalid display index specified
+    #[error("Invalid display index: {0} (available: {1} displays)")]
+    InvalidDisplayIndex(u32, usize),
 }
 
 /// Port for screen capture operations
 #[async_trait]
 pub trait CapturePort: Send + Sync {
     /// Capture a screenshot of the main display
+    ///
+    /// This is the original method for backward compatibility.
+    /// It captures the first available display.
     async fn capture_screen(&self) -> Result<CapturedImage, CaptureError>;
 
     /// Check if screen recording permission is granted
     async fn check_permission(&self) -> Result<bool, CaptureError>;
+
+    /// Get list of available displays
+    ///
+    /// Returns information about all connected displays, including their
+    /// index, width, and height.
+    async fn get_displays(&self) -> Result<Vec<DisplayInfo>, CaptureError>;
+
+    /// Capture a specific display by index
+    ///
+    /// # Arguments
+    /// * `index` - The 0-based index of the display to capture
+    ///
+    /// # Errors
+    /// Returns `CaptureError::InvalidDisplayIndex` if the index is out of range
+    async fn capture_display(&self, index: u32) -> Result<CapturedImage, CaptureError>;
+
+    /// Capture all displays and combine them horizontally into one image
+    ///
+    /// The displays are arranged left-to-right in index order.
+    /// If displays have different heights, they are aligned at the top.
+    async fn capture_all_combined(&self) -> Result<CapturedImage, CaptureError>;
 }
 
 #[cfg(test)]
@@ -70,5 +109,25 @@ mod tests {
 
         let err = CaptureError::UnsupportedOS("12.0".to_string());
         assert!(err.to_string().contains("macOS 12.3"));
+    }
+
+    #[test]
+    fn test_display_info_structure() {
+        let display = DisplayInfo {
+            index: 0,
+            width: 2560,
+            height: 1440,
+        };
+        assert_eq!(display.index, 0);
+        assert_eq!(display.width, 2560);
+        assert_eq!(display.height, 1440);
+    }
+
+    #[test]
+    fn test_invalid_display_index_error() {
+        let err = CaptureError::InvalidDisplayIndex(5, 2);
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid display index: 5"));
+        assert!(msg.contains("available: 2 displays"));
     }
 }

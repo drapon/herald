@@ -295,7 +295,7 @@ enum ResponsePart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use herald_core::ports::ai::UserMessage;
+    use herald_core::ports::ai::{ImageData, UserMessage};
 
     fn create_test_prompt() -> MultimodalPrompt {
         MultimodalPrompt {

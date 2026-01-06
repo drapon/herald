@@ -33,6 +33,18 @@ impl Default for Config {
     }
 }
 
+/// Display selection for capture
+///
+/// Controls which displays are captured and how they are saved.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum DisplaySelection {
+    /// Single display by index (e.g., `display = 0`)
+    Single(u32),
+    /// Multiple displays by indices, saved as separate files (e.g., `display = [0, 1]`)
+    Multiple(Vec<u32>),
+}
+
 /// Capture configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CaptureConfig {
@@ -43,6 +55,14 @@ pub struct CaptureConfig {
     /// PNG compression level 0-9 (default: 6)
     #[serde(default = "default_image_quality")]
     pub image_quality: u8,
+
+    /// Display selection for capture
+    ///
+    /// - `None` (default): Capture all displays and combine them horizontally into one image
+    /// - `Some(Single(n))`: Capture only display n
+    /// - `Some(Multiple([n, m, ...]))`: Capture specified displays as separate files
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplaySelection>,
 }
 
 impl Default for CaptureConfig {
@@ -50,6 +70,7 @@ impl Default for CaptureConfig {
         Self {
             interval_seconds: default_interval_seconds(),
             image_quality: default_image_quality(),
+            display: None,
         }
     }
 }
@@ -512,5 +533,113 @@ data_dir = "/absolute/path/to/herald"
             config.storage.data_dir,
             PathBuf::from("/absolute/path/to/herald")
         );
+    }
+
+    // === DisplaySelection Tests ===
+
+    #[test]
+    fn test_display_selection_default_is_none() {
+        let config = Config::default();
+        assert!(config.capture.display.is_none());
+    }
+
+    #[test]
+    fn test_display_selection_single() {
+        let toml_str = r#"
+[capture]
+display = 0
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.capture.display, Some(DisplaySelection::Single(0)));
+    }
+
+    #[test]
+    fn test_display_selection_single_non_zero() {
+        let toml_str = r#"
+[capture]
+display = 2
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.capture.display, Some(DisplaySelection::Single(2)));
+    }
+
+    #[test]
+    fn test_display_selection_multiple() {
+        let toml_str = r#"
+[capture]
+display = [0, 1]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(
+            config.capture.display,
+            Some(DisplaySelection::Multiple(vec![0, 1]))
+        );
+    }
+
+    #[test]
+    fn test_display_selection_multiple_non_contiguous() {
+        let toml_str = r#"
+[capture]
+display = [0, 2, 4]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(
+            config.capture.display,
+            Some(DisplaySelection::Multiple(vec![0, 2, 4]))
+        );
+    }
+
+    #[test]
+    fn test_display_selection_omitted_uses_none() {
+        let toml_str = r#"
+[capture]
+interval_seconds = 30
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert!(config.capture.display.is_none());
+    }
+
+    #[test]
+    fn test_display_selection_serialization_none_omitted() {
+        let config = Config::default();
+        let toml_str = toml::to_string(&config).expect("Failed to serialize");
+        // display should not appear in output when None
+        assert!(!toml_str.contains("display"));
+    }
+
+    #[test]
+    fn test_display_selection_serialization_single() {
+        let mut config = Config::default();
+        config.capture.display = Some(DisplaySelection::Single(1));
+        let toml_str = toml::to_string(&config).expect("Failed to serialize");
+        assert!(toml_str.contains("display = 1"));
+    }
+
+    #[test]
+    fn test_display_selection_serialization_multiple() {
+        let mut config = Config::default();
+        config.capture.display = Some(DisplaySelection::Multiple(vec![0, 2]));
+        let toml_str = toml::to_string(&config).expect("Failed to serialize");
+        assert!(toml_str.contains("display = [0, 2]"));
+    }
+
+    #[test]
+    fn test_backward_compatibility_no_display_field() {
+        // Old config files without display field should still work
+        let toml_str = r#"
+[capture]
+interval_seconds = 60
+image_quality = 6
+
+[storage]
+retention_seconds = 86400
+
+[ai]
+default_provider = "claude"
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.capture.interval_seconds, 60);
+        assert_eq!(config.capture.image_quality, 6);
+        assert!(config.capture.display.is_none());
     }
 }

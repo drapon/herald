@@ -2,7 +2,7 @@
 //!
 //! Manages automatic screen capture at configurable intervals using Tokio timers.
 
-use crate::config::Config;
+use crate::config::{Config, DisplaySelection};
 use crate::ports::capture::{CaptureError, CapturePort};
 use crate::ports::storage::{CaptureMetadata, StorageError, StoragePort};
 use std::path::PathBuf;
@@ -17,11 +17,13 @@ use tracing::{debug, error, info, warn};
 /// Result of a successful capture operation
 #[derive(Debug, Clone)]
 pub struct CaptureResult {
-    /// Path to the saved image file
+    /// Path to the saved image file (primary file for single/combined capture)
     pub file_path: PathBuf,
+    /// Additional file paths for multiple display capture
+    pub additional_files: Vec<PathBuf>,
     /// Unix timestamp of capture
     pub timestamp: i64,
-    /// Size of the saved file in bytes
+    /// Size of the saved file(s) in bytes
     pub size_bytes: u64,
 }
 
@@ -222,47 +224,139 @@ where
         let start = std::time::Instant::now();
         debug!("Starting capture...");
 
-        // Capture screen
-        let image = capture_port.capture_screen().await?;
-        debug!("Screen captured in {:?}", start.elapsed());
-
-        // Generate filename with timestamp
-        let timestamp = image.timestamp;
-        let datetime = chrono_format_timestamp(timestamp);
-        let filename = format!("{}.png", datetime);
-
-        // Determine save path
-        let captures_dir = config.storage.data_dir.join("captures");
-        let file_path = captures_dir.join(&filename);
-
         // Ensure captures directory exists
+        let captures_dir = config.storage.data_dir.join("captures");
         fs::create_dir_all(&captures_dir).await?;
 
-        // Save image file
-        fs::write(&file_path, &image.data).await?;
-        let size_bytes = image.data.len() as u64;
-        debug!("Image saved to {:?}", file_path);
+        // Capture based on display selection
+        match &config.capture.display {
+            None => {
+                // Default: Capture all displays combined
+                debug!("Capturing all displays combined...");
+                let image = capture_port.capture_all_combined().await?;
+                debug!("Combined capture in {:?}", start.elapsed());
 
-        // Save metadata to database
-        let metadata = CaptureMetadata {
-            id: None,
-            timestamp,
-            file_path: file_path.to_string_lossy().to_string(),
-            created_at: timestamp,
-        };
-        storage_port.save_metadata(metadata).await?;
-        debug!("Metadata saved to database");
+                let timestamp = image.timestamp;
+                let datetime = chrono_format_timestamp(timestamp);
+                let filename = format!("{}.png", datetime);
+                let file_path = captures_dir.join(&filename);
 
-        let elapsed = start.elapsed();
-        if elapsed > Duration::from_secs(1) {
-            warn!("Capture took {:?}, exceeds 1 second target", elapsed);
+                fs::write(&file_path, &image.data).await?;
+                let size_bytes = image.data.len() as u64;
+                debug!("Image saved to {:?}", file_path);
+
+                let metadata = CaptureMetadata {
+                    id: None,
+                    timestamp,
+                    file_path: file_path.to_string_lossy().to_string(),
+                    created_at: timestamp,
+                };
+                storage_port.save_metadata(metadata).await?;
+                debug!("Metadata saved to database");
+
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    warn!("Capture took {:?}, exceeds 1 second target", elapsed);
+                }
+
+                Ok(CaptureResult {
+                    file_path,
+                    additional_files: vec![],
+                    timestamp,
+                    size_bytes,
+                })
+            }
+            Some(DisplaySelection::Single(index)) => {
+                // Single display capture
+                debug!("Capturing display {}...", index);
+                let image = capture_port.capture_display(*index).await?;
+                debug!("Display {} captured in {:?}", index, start.elapsed());
+
+                let timestamp = image.timestamp;
+                let datetime = chrono_format_timestamp(timestamp);
+                let filename = format!("{}.png", datetime);
+                let file_path = captures_dir.join(&filename);
+
+                fs::write(&file_path, &image.data).await?;
+                let size_bytes = image.data.len() as u64;
+                debug!("Image saved to {:?}", file_path);
+
+                let metadata = CaptureMetadata {
+                    id: None,
+                    timestamp,
+                    file_path: file_path.to_string_lossy().to_string(),
+                    created_at: timestamp,
+                };
+                storage_port.save_metadata(metadata).await?;
+                debug!("Metadata saved to database");
+
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    warn!("Capture took {:?}, exceeds 1 second target", elapsed);
+                }
+
+                Ok(CaptureResult {
+                    file_path,
+                    additional_files: vec![],
+                    timestamp,
+                    size_bytes,
+                })
+            }
+            Some(DisplaySelection::Multiple(indices)) => {
+                // Multiple displays as separate files
+                debug!("Capturing {} displays separately...", indices.len());
+
+                let mut file_paths: Vec<PathBuf> = Vec::new();
+                let mut total_size: u64 = 0;
+                let mut timestamp: i64 = 0;
+                let mut datetime = String::new();
+
+                for (i, index) in indices.iter().enumerate() {
+                    let image = capture_port.capture_display(*index).await?;
+
+                    if i == 0 {
+                        timestamp = image.timestamp;
+                        datetime = chrono_format_timestamp(timestamp);
+                    }
+
+                    let filename = format!("{}_display{}.png", datetime, index);
+                    let file_path = captures_dir.join(&filename);
+
+                    fs::write(&file_path, &image.data).await?;
+                    total_size += image.data.len() as u64;
+                    debug!("Display {} saved to {:?}", index, file_path);
+
+                    let metadata = CaptureMetadata {
+                        id: None,
+                        timestamp,
+                        file_path: file_path.to_string_lossy().to_string(),
+                        created_at: timestamp,
+                    };
+                    storage_port.save_metadata(metadata).await?;
+
+                    file_paths.push(file_path);
+                }
+
+                debug!(
+                    "All {} displays captured in {:?}",
+                    indices.len(),
+                    start.elapsed()
+                );
+
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    warn!("Capture took {:?}, exceeds 1 second target", elapsed);
+                }
+
+                let primary_file = file_paths.remove(0);
+                Ok(CaptureResult {
+                    file_path: primary_file,
+                    additional_files: file_paths,
+                    timestamp,
+                    size_bytes: total_size,
+                })
+            }
         }
-
-        Ok(CaptureResult {
-            file_path,
-            timestamp,
-            size_bytes,
-        })
     }
 }
 
@@ -297,50 +391,126 @@ where
     let start = std::time::Instant::now();
     debug!("Starting manual capture...");
 
-    // Capture screen
-    let image = capture_port.capture_screen().await?;
-    debug!("Screen captured in {:?}", start.elapsed());
-
-    // Generate filename with timestamp
-    let timestamp = image.timestamp;
-    let datetime = chrono_format_timestamp(timestamp);
-    let filename = format!("{}.png", datetime);
-
-    // Determine save path
-    let captures_dir = config.storage.data_dir.join("captures");
-    let file_path = captures_dir.join(&filename);
-
     // Ensure captures directory exists
+    let captures_dir = config.storage.data_dir.join("captures");
     fs::create_dir_all(&captures_dir).await?;
 
-    // Save image file
-    fs::write(&file_path, &image.data).await?;
-    let size_bytes = image.data.len() as u64;
-    debug!("Image saved to {:?}", file_path);
+    // Capture based on display selection
+    let result = match &config.capture.display {
+        None => {
+            // Default: Capture all displays combined
+            debug!("Capturing all displays combined...");
+            let image = capture_port.capture_all_combined().await?;
+            debug!("Combined capture in {:?}", start.elapsed());
 
-    // Save metadata to database
-    let metadata = CaptureMetadata {
-        id: None,
-        timestamp,
-        file_path: file_path.to_string_lossy().to_string(),
-        created_at: timestamp,
+            let timestamp = image.timestamp;
+            let datetime = chrono_format_timestamp(timestamp);
+            let filename = format!("{}.png", datetime);
+            let file_path = captures_dir.join(&filename);
+
+            fs::write(&file_path, &image.data).await?;
+            let size_bytes = image.data.len() as u64;
+            debug!("Image saved to {:?}", file_path);
+
+            let metadata = CaptureMetadata {
+                id: None,
+                timestamp,
+                file_path: file_path.to_string_lossy().to_string(),
+                created_at: timestamp,
+            };
+            storage_port.save_metadata(metadata).await?;
+
+            CaptureResult {
+                file_path,
+                additional_files: vec![],
+                timestamp,
+                size_bytes,
+            }
+        }
+        Some(DisplaySelection::Single(index)) => {
+            // Single display capture
+            debug!("Capturing display {}...", index);
+            let image = capture_port.capture_display(*index).await?;
+            debug!("Display {} captured in {:?}", index, start.elapsed());
+
+            let timestamp = image.timestamp;
+            let datetime = chrono_format_timestamp(timestamp);
+            let filename = format!("{}.png", datetime);
+            let file_path = captures_dir.join(&filename);
+
+            fs::write(&file_path, &image.data).await?;
+            let size_bytes = image.data.len() as u64;
+            debug!("Image saved to {:?}", file_path);
+
+            let metadata = CaptureMetadata {
+                id: None,
+                timestamp,
+                file_path: file_path.to_string_lossy().to_string(),
+                created_at: timestamp,
+            };
+            storage_port.save_metadata(metadata).await?;
+
+            CaptureResult {
+                file_path,
+                additional_files: vec![],
+                timestamp,
+                size_bytes,
+            }
+        }
+        Some(DisplaySelection::Multiple(indices)) => {
+            // Multiple displays as separate files
+            debug!("Capturing {} displays separately...", indices.len());
+
+            let mut file_paths: Vec<PathBuf> = Vec::new();
+            let mut total_size: u64 = 0;
+            let mut timestamp: i64 = 0;
+            let mut datetime = String::new();
+
+            for (i, index) in indices.iter().enumerate() {
+                let image = capture_port.capture_display(*index).await?;
+
+                if i == 0 {
+                    timestamp = image.timestamp;
+                    datetime = chrono_format_timestamp(timestamp);
+                }
+
+                let filename = format!("{}_display{}.png", datetime, index);
+                let file_path = captures_dir.join(&filename);
+
+                fs::write(&file_path, &image.data).await?;
+                total_size += image.data.len() as u64;
+                debug!("Display {} saved to {:?}", index, file_path);
+
+                let metadata = CaptureMetadata {
+                    id: None,
+                    timestamp,
+                    file_path: file_path.to_string_lossy().to_string(),
+                    created_at: timestamp,
+                };
+                storage_port.save_metadata(metadata).await?;
+
+                file_paths.push(file_path);
+            }
+
+            let primary_file = file_paths.remove(0);
+            CaptureResult {
+                file_path: primary_file,
+                additional_files: file_paths,
+                timestamp,
+                size_bytes: total_size,
+            }
+        }
     };
-    storage_port.save_metadata(metadata).await?;
-    debug!("Metadata saved to database");
 
     let elapsed = start.elapsed();
     info!(
         "Manual capture completed: {} ({} bytes) in {:?}",
-        file_path.display(),
-        size_bytes,
+        result.file_path.display(),
+        result.size_bytes,
         elapsed
     );
 
-    Ok(CaptureResult {
-        file_path,
-        timestamp,
-        size_bytes,
-    })
+    Ok(result)
 }
 
 /// Format Unix timestamp as YYYY-MM-DD_HH-mm-ss (UTC)
@@ -399,7 +569,7 @@ fn is_leap_year(year: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::capture::CapturedImage;
+    use crate::ports::capture::{CapturedImage, DisplayInfo};
     use async_trait::async_trait;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
@@ -456,6 +626,63 @@ mod tests {
 
         async fn check_permission(&self) -> Result<bool, CaptureError> {
             Ok(true)
+        }
+
+        async fn get_displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
+            Ok(vec![
+                DisplayInfo {
+                    index: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                DisplayInfo {
+                    index: 1,
+                    width: 1920,
+                    height: 1080,
+                },
+            ])
+        }
+
+        async fn capture_display(&self, _index: u32) -> Result<CapturedImage, CaptureError> {
+            self.capture_count.fetch_add(1, Ordering::SeqCst);
+
+            if self.should_fail.load(Ordering::SeqCst) {
+                self.fail_count.fetch_add(1, Ordering::SeqCst);
+                return Err(CaptureError::CaptureFailed("Mock failure".to_string()));
+            }
+
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+
+            Ok(CapturedImage {
+                data: vec![0u8; 100],
+                width: 100,
+                height: 100,
+                timestamp,
+            })
+        }
+
+        async fn capture_all_combined(&self) -> Result<CapturedImage, CaptureError> {
+            self.capture_count.fetch_add(1, Ordering::SeqCst);
+
+            if self.should_fail.load(Ordering::SeqCst) {
+                self.fail_count.fetch_add(1, Ordering::SeqCst);
+                return Err(CaptureError::CaptureFailed("Mock failure".to_string()));
+            }
+
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+
+            Ok(CapturedImage {
+                data: vec![0u8; 200], // Combined image data
+                width: 200,
+                height: 100,
+                timestamp,
+            })
         }
     }
 

@@ -4,7 +4,8 @@
 //! Requires macOS 14.0+ for SCScreenshotManager API.
 
 use async_trait::async_trait;
-use herald_core::ports::capture::{CaptureError, CapturePort, CapturedImage};
+use herald_core::ports::capture::{CaptureError, CapturePort, CapturedImage, DisplayInfo};
+use image::{ImageBuffer, Rgba, RgbaImage};
 use png::{BitDepth, ColorType, Encoder};
 use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::SCScreenshotManager;
@@ -108,6 +109,136 @@ impl ScreenCaptureKitAdapter {
             .into_iter()
             .next()
             .ok_or_else(|| CaptureError::CaptureFailed("No displays found".to_string()))
+    }
+
+    /// Get all available displays
+    fn get_all_displays() -> Result<Vec<SCDisplay>, CaptureError> {
+        let content =
+            SCShareableContent::get().map_err(|e: screencapturekit::error::SCError| {
+                let msg = e.to_string();
+                if msg.to_lowercase().contains("permission")
+                    || msg.to_lowercase().contains("denied")
+                    || msg.to_lowercase().contains("not authorized")
+                {
+                    CaptureError::PermissionDenied
+                } else {
+                    CaptureError::CaptureFailed(format!("Failed to get shareable content: {}", msg))
+                }
+            })?;
+
+        let displays = content.displays();
+        if displays.is_empty() {
+            return Err(CaptureError::CaptureFailed("No displays found".to_string()));
+        }
+        Ok(displays)
+    }
+
+    /// Capture a specific SCDisplay and return RGBA data with dimensions
+    fn capture_display_raw(
+        display: &SCDisplay,
+        target_width: Option<u32>,
+        target_height: Option<u32>,
+    ) -> Result<(Vec<u8>, u32, u32), CaptureError> {
+        let display_width = display.width() as u32;
+        let display_height = display.height() as u32;
+
+        let filter = SCContentFilter::create()
+            .with_display(display)
+            .with_excluding_windows(&[])
+            .build();
+
+        let capture_width = target_width.unwrap_or(display_width);
+        let capture_height = target_height.unwrap_or(display_height);
+
+        let config = SCStreamConfiguration::new()
+            .with_width(capture_width)
+            .with_height(capture_height)
+            .with_shows_cursor(true);
+
+        let image = SCScreenshotManager::capture_image(&filter, &config).map_err(
+            |e: screencapturekit::error::SCError| {
+                let msg = e.to_string();
+                if msg.to_lowercase().contains("permission")
+                    || msg.to_lowercase().contains("denied")
+                {
+                    CaptureError::PermissionDenied
+                } else if msg.contains("version") || msg.contains("14.0") {
+                    CaptureError::UnsupportedOS("macOS 14.0+ required for screenshots".to_string())
+                } else {
+                    CaptureError::CaptureFailed(format!("Screenshot capture failed: {}", msg))
+                }
+            },
+        )?;
+
+        let img_width = image.width() as u32;
+        let img_height = image.height() as u32;
+
+        let rgba_data = image
+            .rgba_data()
+            .map_err(|e| CaptureError::CaptureFailed(format!("Failed to get RGBA data: {}", e)))?;
+
+        Ok((rgba_data, img_width, img_height))
+    }
+
+    /// Combine multiple RGBA images horizontally into one image
+    fn combine_images_horizontally(
+        images: Vec<(Vec<u8>, u32, u32)>,
+    ) -> Result<(Vec<u8>, u32, u32), CaptureError> {
+        if images.is_empty() {
+            return Err(CaptureError::CaptureFailed(
+                "No images to combine".to_string(),
+            ));
+        }
+
+        if images.len() == 1 {
+            return Ok(images.into_iter().next().unwrap());
+        }
+
+        // Calculate total dimensions
+        let total_width: u32 = images.iter().map(|(_, w, _)| *w).sum();
+        let max_height: u32 = images.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
+
+        debug!(
+            "Combining {} images: total width={}, max height={}",
+            images.len(),
+            total_width,
+            max_height
+        );
+
+        // Create a new canvas
+        let mut canvas: RgbaImage = ImageBuffer::new(total_width, max_height);
+
+        // Fill with black background
+        for pixel in canvas.pixels_mut() {
+            *pixel = Rgba([0, 0, 0, 255]);
+        }
+
+        // Place each image on the canvas
+        let mut x_offset: u32 = 0;
+        for (rgba_data, width, height) in images {
+            // Create ImageBuffer from raw RGBA data
+            let img: RgbaImage =
+                ImageBuffer::from_raw(width, height, rgba_data).ok_or_else(|| {
+                    CaptureError::CaptureFailed(
+                        "Failed to create image buffer from RGBA data".to_string(),
+                    )
+                })?;
+
+            // Copy pixels to canvas (top-aligned)
+            for y in 0..height {
+                for x in 0..width {
+                    let pixel = img.get_pixel(x, y);
+                    canvas.put_pixel(x_offset + x, y, *pixel);
+                }
+            }
+
+            x_offset += width;
+        }
+
+        // Convert canvas back to raw RGBA bytes
+        let combined_rgba = canvas.into_raw();
+
+        Ok((combined_rgba, total_width, max_height))
     }
 
     /// Encode image data as PNG
@@ -281,6 +412,135 @@ impl CapturePort for ScreenCaptureKitAdapter {
         .await
         .map_err(|e| CaptureError::CaptureFailed(format!("Task join error: {}", e)))?
     }
+
+    async fn get_displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
+        tokio::task::spawn_blocking(|| {
+            // Check macOS version
+            Self::check_macos_version(MIN_MACOS_MAJOR, MIN_MACOS_MINOR)?;
+
+            let displays = Self::get_all_displays()?;
+
+            Ok(displays
+                .into_iter()
+                .enumerate()
+                .map(|(index, display)| DisplayInfo {
+                    index: index as u32,
+                    width: display.width() as u32,
+                    height: display.height() as u32,
+                })
+                .collect())
+        })
+        .await
+        .map_err(|e| CaptureError::CaptureFailed(format!("Task join error: {}", e)))?
+    }
+
+    async fn capture_display(&self, index: u32) -> Result<CapturedImage, CaptureError> {
+        let width = self.width;
+        let height = self.height;
+
+        tokio::task::spawn_blocking(move || {
+            // Check macOS version
+            debug!("Checking macOS version...");
+            Self::check_macos_version(MIN_SCREENSHOT_MAJOR, MIN_SCREENSHOT_MINOR)?;
+
+            debug!("Getting all displays...");
+            let displays = Self::get_all_displays()?;
+
+            let target_display = displays
+                .get(index as usize)
+                .ok_or_else(|| CaptureError::InvalidDisplayIndex(index, displays.len()))?;
+
+            info!(
+                "Capturing display {}: {}x{}",
+                index,
+                target_display.width(),
+                target_display.height()
+            );
+
+            let (rgba_data, img_width, img_height) =
+                Self::capture_display_raw(target_display, width, height)?;
+
+            debug!("Encoding as PNG...");
+            let png_data = Self::encode_png(&rgba_data, img_width, img_height)?;
+
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            info!(
+                "Display {} captured: {}x{}, {} bytes PNG",
+                index,
+                img_width,
+                img_height,
+                png_data.len()
+            );
+
+            Ok(CapturedImage {
+                data: png_data,
+                width: img_width,
+                height: img_height,
+                timestamp,
+            })
+        })
+        .await
+        .map_err(|e| CaptureError::CaptureFailed(format!("Task join error: {}", e)))?
+    }
+
+    async fn capture_all_combined(&self) -> Result<CapturedImage, CaptureError> {
+        tokio::task::spawn_blocking(|| {
+            // Check macOS version
+            debug!("Checking macOS version...");
+            Self::check_macos_version(MIN_SCREENSHOT_MAJOR, MIN_SCREENSHOT_MINOR)?;
+
+            debug!("Getting all displays...");
+            let displays = Self::get_all_displays()?;
+
+            info!("Capturing {} displays for combination...", displays.len());
+
+            // Capture all displays
+            let mut captured_images: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+            for (index, disp) in displays.iter().enumerate() {
+                debug!(
+                    "Capturing display {}: {}x{}",
+                    index,
+                    disp.width(),
+                    disp.height()
+                );
+                let (rgba_data, width, height) = Self::capture_display_raw(disp, None, None)?;
+                captured_images.push((rgba_data, width, height));
+            }
+
+            // Combine images horizontally
+            debug!("Combining {} captured images...", captured_images.len());
+            let (combined_rgba, total_width, total_height) =
+                Self::combine_images_horizontally(captured_images)?;
+
+            debug!("Encoding combined image as PNG...");
+            let png_data = Self::encode_png(&combined_rgba, total_width, total_height)?;
+
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            info!(
+                "Combined screenshot captured: {}x{}, {} bytes PNG",
+                total_width,
+                total_height,
+                png_data.len()
+            );
+
+            Ok(CapturedImage {
+                data: png_data,
+                width: total_width,
+                height: total_height,
+                timestamp,
+            })
+        })
+        .await
+        .map_err(|e| CaptureError::CaptureFailed(format!("Task join error: {}", e)))?
+    }
 }
 
 #[cfg(test)]
@@ -346,5 +606,64 @@ mod tests {
         if let Ok(version) = result {
             assert!(!version.is_empty());
         }
+    }
+
+    #[test]
+    fn test_combine_images_horizontally_single() {
+        // Single image should be returned as-is
+        let rgba_data = vec![255u8; 4 * 2 * 2]; // 2x2 image
+        let images = vec![(rgba_data.clone(), 2, 2)];
+
+        let result = ScreenCaptureKitAdapter::combine_images_horizontally(images);
+        assert!(result.is_ok());
+
+        let (combined, width, height) = result.unwrap();
+        assert_eq!(width, 2);
+        assert_eq!(height, 2);
+        assert_eq!(combined.len(), rgba_data.len());
+    }
+
+    #[test]
+    fn test_combine_images_horizontally_two_same_size() {
+        // Two 2x2 images should become 4x2
+        // 4 pixels * 4 bytes per pixel = 16 bytes
+        let rgba_data1 = [255u8, 0, 0, 255].repeat(4); // Red 2x2
+        let rgba_data2 = [0u8, 255, 0, 255].repeat(4); // Green 2x2
+
+        let images = vec![(rgba_data1, 2, 2), (rgba_data2, 2, 2)];
+
+        let result = ScreenCaptureKitAdapter::combine_images_horizontally(images);
+        assert!(result.is_ok());
+
+        let (combined, width, height) = result.unwrap();
+        assert_eq!(width, 4);
+        assert_eq!(height, 2);
+        assert_eq!(combined.len(), 4 * 4 * 2); // 4 bytes per pixel * 4 width * 2 height
+    }
+
+    #[test]
+    fn test_combine_images_horizontally_different_heights() {
+        // Two images with different heights
+        // 2x3 = 6 pixels, 2x2 = 4 pixels
+        let rgba_data1 = [255u8, 0, 0, 255].repeat(6); // 2x3 (taller)
+        let rgba_data2 = [0u8, 255, 0, 255].repeat(4); // 2x2
+
+        let images = vec![(rgba_data1, 2, 3), (rgba_data2, 2, 2)];
+
+        let result = ScreenCaptureKitAdapter::combine_images_horizontally(images);
+        assert!(result.is_ok());
+
+        let (combined, width, height) = result.unwrap();
+        assert_eq!(width, 4);
+        assert_eq!(height, 3); // Max height
+        assert_eq!(combined.len(), 4 * 4 * 3);
+    }
+
+    #[test]
+    fn test_combine_images_horizontally_empty() {
+        let images: Vec<(Vec<u8>, u32, u32)> = vec![];
+
+        let result = ScreenCaptureKitAdapter::combine_images_horizontally(images);
+        assert!(result.is_err());
     }
 }

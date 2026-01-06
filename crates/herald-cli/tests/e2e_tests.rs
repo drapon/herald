@@ -525,6 +525,24 @@ mod scheduler_integration {
         async fn check_permission(&self) -> Result<bool, CaptureError> {
             Ok(true)
         }
+
+        async fn get_displays(
+            &self,
+        ) -> Result<Vec<herald_core::ports::capture::DisplayInfo>, CaptureError> {
+            Ok(vec![herald_core::ports::capture::DisplayInfo {
+                index: 0,
+                width: 100,
+                height: 100,
+            }])
+        }
+
+        async fn capture_display(&self, _index: u32) -> Result<CapturedImage, CaptureError> {
+            self.capture_screen().await
+        }
+
+        async fn capture_all_combined(&self) -> Result<CapturedImage, CaptureError> {
+            self.capture_screen().await
+        }
     }
 
     /// Test: Manual capture saves file and metadata
@@ -785,6 +803,20 @@ mod error_handling {
         async fn check_permission(&self) -> Result<bool, CaptureError> {
             Ok(false)
         }
+
+        async fn get_displays(
+            &self,
+        ) -> Result<Vec<herald_core::ports::capture::DisplayInfo>, CaptureError> {
+            Err(CaptureError::PermissionDenied)
+        }
+
+        async fn capture_display(&self, _index: u32) -> Result<CapturedImage, CaptureError> {
+            Err(CaptureError::PermissionDenied)
+        }
+
+        async fn capture_all_combined(&self) -> Result<CapturedImage, CaptureError> {
+            Err(CaptureError::PermissionDenied)
+        }
     }
 
     /// Test: Permission denied error is handled
@@ -846,6 +878,24 @@ mod performance {
 
         async fn check_permission(&self) -> Result<bool, CaptureError> {
             Ok(true)
+        }
+
+        async fn get_displays(
+            &self,
+        ) -> Result<Vec<herald_core::ports::capture::DisplayInfo>, CaptureError> {
+            Ok(vec![herald_core::ports::capture::DisplayInfo {
+                index: 0,
+                width: 1920,
+                height: 1080,
+            }])
+        }
+
+        async fn capture_display(&self, _index: u32) -> Result<CapturedImage, CaptureError> {
+            self.capture_screen().await
+        }
+
+        async fn capture_all_combined(&self) -> Result<CapturedImage, CaptureError> {
+            self.capture_screen().await
         }
     }
 
