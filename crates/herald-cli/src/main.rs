@@ -31,6 +31,8 @@ enum Commands {
     },
     /// Capture a screenshot immediately
     Capture,
+    /// List available displays
+    Displays,
     /// Show daemon status and capture statistics
     Status,
     /// Get AI suggestions based on recent captures
@@ -59,6 +61,7 @@ async fn main() -> Result<()> {
             DaemonAction::Stop => commands::daemon::stop().await,
         },
         Some(Commands::Capture) => commands::capture::run().await,
+        Some(Commands::Displays) => commands::displays::run().await,
         Some(Commands::Status) => commands::status::run().await,
         Some(Commands::Suggest { intent }) => commands::suggest::run(&intent).await,
         None => {

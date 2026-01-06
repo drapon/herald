@@ -4,5 +4,6 @@
 
 pub mod capture;
 pub mod daemon;
+pub mod displays;
 pub mod status;
 pub mod suggest;

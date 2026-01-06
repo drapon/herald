@@ -39,6 +39,12 @@ Herald uses TOML configuration at `~/.herald/config.toml`:
 interval_seconds = 60    # Capture interval (default: 60)
 image_quality = 6        # PNG compression 0-9 (default: 6)
 
+# Display selection (optional)
+# - Omit: Capture all displays combined into one image (default)
+# - Single number: Capture only that display (e.g., display = 0)
+# - Array: Capture multiple displays as separate files (e.g., display = [0, 1])
+# display = 0
+
 [storage]
 data_dir = "~/.herald"   # Data directory
 retention_seconds = 86400 # Keep for 24 hours (default)
@@ -68,6 +74,9 @@ herald daemon stop
 
 # Manual capture
 herald capture
+
+# List available displays
+herald displays
 
 # Check status
 herald status
