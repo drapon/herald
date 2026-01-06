@@ -58,7 +58,10 @@ impl Default for CaptureConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StorageConfig {
     /// Base data directory (default: ~/.herald/)
-    #[serde(default = "default_data_dir")]
+    #[serde(
+        default = "default_data_dir",
+        deserialize_with = "deserialize_data_dir"
+    )]
     pub data_dir: PathBuf,
 
     /// Data retention period in seconds (default: 86400 = 24 hours)
@@ -107,7 +110,7 @@ fn default_image_quality() -> u8 {
 
 fn default_data_dir() -> PathBuf {
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .expect("ホームディレクトリを取得できませんでした")
         .join(".herald")
 }
 
@@ -121,6 +124,37 @@ fn default_provider() -> String {
 
 fn default_model() -> String {
     "claude-3-5-sonnet-20241022".to_string()
+}
+
+/// Expands tilde (~) in a path to the home directory
+///
+/// # Arguments
+/// * `path` - Path that may contain a leading tilde
+///
+/// # Returns
+/// * Expanded PathBuf with tilde replaced by home directory
+fn expand_tilde(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(path_str.strip_prefix("~/").unwrap());
+        }
+    } else if path_str == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Custom deserializer for data_dir that expands tilde
+fn deserialize_data_dir<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let path_str = String::deserialize(deserializer)?;
+    let path = PathBuf::from(path_str);
+    Ok(expand_tilde(&path))
 }
 
 impl Config {
@@ -426,5 +460,57 @@ default_provider = "invalid"
         let path = get_default_config_path();
         assert!(path.ends_with("config.toml"));
         assert!(path.to_string_lossy().contains(".herald"));
+    }
+
+    #[test]
+    fn test_tilde_expansion_in_data_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Create config with tilde in data_dir
+        let config_with_tilde = r#"
+[storage]
+data_dir = "~/.herald"
+"#;
+        fs::write(&config_path, config_with_tilde).unwrap();
+
+        let config = load_config_from_path(&config_path).unwrap();
+
+        // data_dir should be expanded to home directory
+        let home = dirs::home_dir().expect("Failed to get home directory");
+        let expected_path = home.join(".herald");
+        assert_eq!(config.storage.data_dir, expected_path);
+
+        // Verify it's an absolute path, not a relative path with literal "~"
+        assert!(config.storage.data_dir.is_absolute());
+        assert!(!config.storage.data_dir.to_string_lossy().starts_with("~"));
+    }
+
+    #[test]
+    fn test_tilde_expansion_with_subdirectories() {
+        let toml_str = r#"
+[storage]
+data_dir = "~/my_custom/herald_data"
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+
+        let home = dirs::home_dir().expect("Failed to get home directory");
+        let expected_path = home.join("my_custom/herald_data");
+        assert_eq!(config.storage.data_dir, expected_path);
+        assert!(config.storage.data_dir.is_absolute());
+    }
+
+    #[test]
+    fn test_absolute_path_unchanged() {
+        let toml_str = r#"
+[storage]
+data_dir = "/absolute/path/to/herald"
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+
+        assert_eq!(
+            config.storage.data_dir,
+            PathBuf::from("/absolute/path/to/herald")
+        );
     }
 }

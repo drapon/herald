@@ -33,7 +33,7 @@ impl DirectoryManager {
     /// Creates a DirectoryManager with the default data directory (~/.herald/)
     pub fn with_default_dir() -> Self {
         let data_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+            .expect("ホームディレクトリを取得できませんでした")
             .join(".herald");
         Self::new(data_dir)
     }
