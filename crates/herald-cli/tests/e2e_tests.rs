@@ -847,6 +847,285 @@ mod error_handling {
 // These tests verify performance requirements are met
 // ============================================================================
 
+mod activity_storage_integration {
+    use super::*;
+    use herald_core::ports::activity::{Activity, ActivityCategory, ActivityStoragePort};
+    use herald_core::ports::storage::CaptureMetadata;
+    use herald_core::ports::StoragePort;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Test: Activity CRUD operations work correctly
+    #[tokio::test]
+    async fn test_activity_crud_operations() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // First create a capture to reference
+        let capture = CaptureMetadata {
+            id: None,
+            timestamp: now,
+            file_path: "/test/capture.png".to_string(),
+            created_at: now,
+        };
+        adapter.save_metadata(capture).await.unwrap();
+
+        let captures = adapter.get_recent_captures(1).await.unwrap();
+        let capture_id = captures[0].id.unwrap();
+
+        // Create activity
+        let activity = Activity {
+            id: None,
+            capture_id,
+            timestamp: now,
+            application_name: "Visual Studio Code".to_string(),
+            activity_description: "Writing integration tests".to_string(),
+            category: ActivityCategory::Coding,
+            created_at: now,
+        };
+
+        let activity_id = adapter.save_activity(activity).await.unwrap();
+        assert!(activity_id > 0);
+
+        // Read activities
+        let activities = adapter
+            .get_activities_by_date_range(now - 3600, now + 3600)
+            .await
+            .unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].application_name, "Visual Studio Code");
+        assert_eq!(activities[0].category, ActivityCategory::Coding);
+    }
+
+    /// Test: Unanalyzed captures are correctly identified
+    #[tokio::test]
+    async fn test_unanalyzed_captures_detection() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Create 3 captures
+        for i in 0..3 {
+            let capture = CaptureMetadata {
+                id: None,
+                timestamp: now + i * 60,
+                file_path: format!("/test/capture_{}.png", i),
+                created_at: now + i * 60,
+            };
+            adapter.save_metadata(capture).await.unwrap();
+        }
+
+        // All should be unanalyzed initially
+        let unanalyzed = adapter.get_unanalyzed_captures(10).await.unwrap();
+        assert_eq!(unanalyzed.len(), 3);
+
+        // Analyze one capture
+        let activity = Activity {
+            id: None,
+            capture_id: unanalyzed[0].id,
+            timestamp: now,
+            application_name: "Test App".to_string(),
+            activity_description: "Testing".to_string(),
+            category: ActivityCategory::Other("test".to_string()),
+            created_at: now,
+        };
+        adapter.save_activity(activity).await.unwrap();
+
+        // Now only 2 should be unanalyzed
+        let unanalyzed_after = adapter.get_unanalyzed_captures(10).await.unwrap();
+        assert_eq!(unanalyzed_after.len(), 2);
+    }
+
+    /// Test: Activity statistics are calculated correctly
+    #[tokio::test]
+    async fn test_activity_statistics() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Create captures and activities with different apps and categories
+        let test_data = vec![
+            ("VS Code", ActivityCategory::Coding),
+            ("VS Code", ActivityCategory::Coding),
+            ("Chrome", ActivityCategory::Browsing),
+            ("VS Code", ActivityCategory::Coding),
+            ("Slack", ActivityCategory::Communication),
+        ];
+
+        for (i, (app_name, category)) in test_data.iter().enumerate() {
+            // Create capture
+            let capture = CaptureMetadata {
+                id: None,
+                timestamp: now + (i as i64) * 60,
+                file_path: format!("/test/capture_{}.png", i),
+                created_at: now + (i as i64) * 60,
+            };
+            adapter.save_metadata(capture).await.unwrap();
+
+            let captures = adapter.get_recent_captures(1).await.unwrap();
+            let capture_id = captures[0].id.unwrap();
+
+            // Create activity
+            let activity = Activity {
+                id: None,
+                capture_id,
+                timestamp: now + (i as i64) * 60,
+                application_name: app_name.to_string(),
+                activity_description: format!("Activity {}", i),
+                category: category.clone(),
+                created_at: now,
+            };
+            adapter.save_activity(activity).await.unwrap();
+        }
+
+        // Check application stats
+        let app_stats = adapter
+            .get_stats_by_application(now - 3600, now + 3600)
+            .await
+            .unwrap();
+        assert!(!app_stats.is_empty());
+
+        let vs_code_stats = app_stats.iter().find(|s| s.application_name == "VS Code");
+        assert!(vs_code_stats.is_some());
+        assert_eq!(vs_code_stats.unwrap().count, 3);
+
+        // Check category stats
+        let cat_stats = adapter
+            .get_stats_by_category(now - 3600, now + 3600)
+            .await
+            .unwrap();
+        assert!(!cat_stats.is_empty());
+
+        let coding_stats = cat_stats
+            .iter()
+            .find(|s| s.category == ActivityCategory::Coding);
+        assert!(coding_stats.is_some());
+        assert_eq!(coding_stats.unwrap().count, 3);
+    }
+
+    /// Test: Activity cascade delete works
+    #[tokio::test]
+    async fn test_activity_cascade_delete() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Create capture
+        let capture = CaptureMetadata {
+            id: None,
+            timestamp: now,
+            file_path: "/test/capture.png".to_string(),
+            created_at: now,
+        };
+        adapter.save_metadata(capture).await.unwrap();
+
+        let captures = adapter.get_recent_captures(1).await.unwrap();
+        let capture_id = captures[0].id.unwrap();
+
+        // Create activity
+        let activity = Activity {
+            id: None,
+            capture_id,
+            timestamp: now,
+            application_name: "Test".to_string(),
+            activity_description: "Testing".to_string(),
+            category: ActivityCategory::Coding,
+            created_at: now,
+        };
+        adapter.save_activity(activity).await.unwrap();
+
+        // Verify activity exists
+        let activities = adapter
+            .get_activities_by_date_range(now - 3600, now + 3600)
+            .await
+            .unwrap();
+        assert_eq!(activities.len(), 1);
+
+        // Delete capture
+        adapter.delete_capture(capture_id).await.unwrap();
+
+        // Activity should be deleted via cascade
+        let activities_after = adapter
+            .get_activities_by_date_range(now - 3600, now + 3600)
+            .await
+            .unwrap();
+        assert_eq!(activities_after.len(), 0);
+    }
+
+    /// Test: Today activities filter works correctly
+    #[tokio::test]
+    async fn test_today_activities_filter() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Create a capture and activity for today
+        let capture = CaptureMetadata {
+            id: None,
+            timestamp: now,
+            file_path: "/test/today.png".to_string(),
+            created_at: now,
+        };
+        adapter.save_metadata(capture).await.unwrap();
+
+        let captures = adapter.get_recent_captures(1).await.unwrap();
+        let capture_id = captures[0].id.unwrap();
+
+        let activity = Activity {
+            id: None,
+            capture_id,
+            timestamp: now,
+            application_name: "Today App".to_string(),
+            activity_description: "Today's work".to_string(),
+            category: ActivityCategory::Coding,
+            created_at: now,
+        };
+        adapter.save_activity(activity).await.unwrap();
+
+        // Get today's activities
+        let today_activities = adapter.get_today_activities().await.unwrap();
+        assert!(!today_activities.is_empty());
+        assert!(today_activities
+            .iter()
+            .any(|a| a.application_name == "Today App"));
+    }
+}
+
 mod performance {
     use super::*;
     use herald_core::ports::capture::{CaptureError, CapturePort, CapturedImage};
@@ -1072,5 +1351,432 @@ mod performance {
             "Concurrent captures took {:?}, expected faster execution",
             elapsed
         );
+    }
+}
+
+// ============================================================================
+// Activity CLI E2E Tests (Task 10.2)
+// These tests verify CLI command output formats and functionality
+// ============================================================================
+
+mod activity_cli_e2e {
+    use super::*;
+    use herald_core::exporter::{ActivityExporter, ExportOptions};
+    use herald_core::ports::activity::{
+        Activity, ActivityAnalyzerPort, ActivityCategory, ActivityStoragePort, AnalysisError,
+        AnalysisResult, CaptureForAnalysis,
+    };
+    use herald_core::ports::storage::CaptureMetadata;
+    use herald_core::ports::StoragePort;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Helper to create test activities in database
+    async fn setup_test_activities(adapter: &herald_adapters::SqliteAdapter) -> Vec<Activity> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut activities = Vec::new();
+
+        // Create captures first
+        for i in 0..3 {
+            let capture = CaptureMetadata {
+                id: None,
+                timestamp: now - (i * 3600), // 1 hour apart
+                file_path: format!("/test/cli_capture_{}.png", i),
+                created_at: now,
+            };
+            adapter.save_metadata(capture).await.unwrap();
+        }
+
+        let captures = adapter.get_recent_captures(3).await.unwrap();
+
+        // Create activities for each capture
+        let test_data = vec![
+            ("VS Code", "Editing Rust code", ActivityCategory::Coding),
+            (
+                "Slack",
+                "Team communication",
+                ActivityCategory::Communication,
+            ),
+            (
+                "Chrome",
+                "Reading documentation",
+                ActivityCategory::Documentation,
+            ),
+        ];
+
+        for (i, (app, desc, cat)) in test_data.into_iter().enumerate() {
+            let activity = Activity {
+                id: None,
+                capture_id: captures[i].id.unwrap(),
+                timestamp: now - (i as i64 * 3600),
+                application_name: app.to_string(),
+                activity_description: desc.to_string(),
+                category: cat,
+                created_at: now,
+            };
+            adapter.save_activity(activity.clone()).await.unwrap();
+            activities.push(activity);
+        }
+
+        activities
+    }
+
+    /// Test: activity list output format verification
+    #[tokio::test]
+    async fn test_activity_list_output_format() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        let activities = setup_test_activities(&adapter).await;
+
+        // Verify activities were saved
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let retrieved = adapter
+            .get_activities_by_date_range(now - 86400, now + 86400)
+            .await
+            .unwrap();
+
+        assert_eq!(retrieved.len(), 3);
+
+        // Verify each activity has required fields
+        for activity in &retrieved {
+            assert!(!activity.application_name.is_empty());
+            assert!(!activity.activity_description.is_empty());
+            assert!(activity.timestamp > 0);
+        }
+    }
+
+    /// Test: activity export --format jsonl output verification
+    #[tokio::test]
+    async fn test_activity_export_jsonl_format() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        setup_test_activities(&adapter).await;
+
+        // Get activities and export to JSONL
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let activities = adapter
+            .get_activities_by_date_range(now - 86400, now + 86400)
+            .await
+            .unwrap();
+
+        let jsonl_output = ActivityExporter::to_jsonl(&activities);
+
+        // Verify JSONL format
+        let lines: Vec<&str> = jsonl_output.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "Should have 3 lines for 3 activities");
+
+        // Each line should be valid JSON with required fields
+        for line in lines {
+            // Line should start with { and end with }
+            assert!(line.trim().starts_with('{'), "Line should be JSON object");
+            assert!(line.trim().ends_with('}'), "Line should be JSON object");
+
+            // Verify required fields exist in the JSON string
+            assert!(
+                line.contains("\"capture_id\""),
+                "Should have capture_id field"
+            );
+            assert!(
+                line.contains("\"timestamp\""),
+                "Should have timestamp field"
+            );
+            assert!(
+                line.contains("\"application_name\""),
+                "Should have application_name field"
+            );
+            assert!(
+                line.contains("\"activity_description\""),
+                "Should have activity_description field"
+            );
+            assert!(line.contains("\"category\""), "Should have category field");
+        }
+    }
+
+    /// Test: activity export --format markdown output verification
+    #[tokio::test]
+    async fn test_activity_export_markdown_format() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        setup_test_activities(&adapter).await;
+
+        // Get activities and export to Markdown
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let activities = adapter
+            .get_activities_by_date_range(now - 86400, now + 86400)
+            .await
+            .unwrap();
+
+        let md_output = ActivityExporter::to_markdown(
+            &activities,
+            ExportOptions {
+                include_summary: true,
+                group_by_date: true,
+            },
+        );
+
+        // Verify Markdown format contains expected elements
+        assert!(md_output.contains("# Activity Report"), "Should have title");
+        assert!(
+            md_output.contains("## Summary"),
+            "Should have summary section"
+        );
+        assert!(md_output.contains("VS Code"), "Should contain app name");
+        assert!(
+            md_output.contains("Editing Rust code"),
+            "Should contain activity description"
+        );
+
+        // Verify it's proper markdown (has headers)
+        assert!(md_output.contains("#"), "Should have markdown headers");
+    }
+
+    /// Test: activity export markdown without summary
+    #[tokio::test]
+    async fn test_activity_export_markdown_no_summary() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        setup_test_activities(&adapter).await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let activities = adapter
+            .get_activities_by_date_range(now - 86400, now + 86400)
+            .await
+            .unwrap();
+
+        let md_output = ActivityExporter::to_markdown(
+            &activities,
+            ExportOptions {
+                include_summary: false,
+                group_by_date: false,
+            },
+        );
+
+        // Without summary flag, should not have summary section
+        assert!(
+            !md_output.contains("## Summary"),
+            "Should not have summary section"
+        );
+        // But should still have activities
+        assert!(md_output.contains("VS Code"), "Should contain app name");
+    }
+
+    /// Mock AI analyzer for testing analyze command flow
+    struct MockActivityAnalyzer {
+        should_fail: bool,
+    }
+
+    #[async_trait]
+    impl ActivityAnalyzerPort for MockActivityAnalyzer {
+        async fn analyze(
+            &self,
+            capture: CaptureForAnalysis,
+        ) -> Result<AnalysisResult, AnalysisError> {
+            if self.should_fail {
+                return Err(AnalysisError::AIError("Mock failure".to_string()));
+            }
+
+            Ok(AnalysisResult {
+                application_name: format!("MockApp_{}", capture.id),
+                activity_description: "Mock activity description".to_string(),
+                category: ActivityCategory::Coding,
+            })
+        }
+
+        async fn analyze_batch(
+            &self,
+            captures: Vec<CaptureForAnalysis>,
+        ) -> Vec<Result<(i64, AnalysisResult), AnalysisError>> {
+            let mut results = Vec::new();
+            for capture in captures {
+                let capture_id = capture.id;
+                match self.analyze(capture).await {
+                    Ok(result) => results.push(Ok((capture_id, result))),
+                    Err(e) => results.push(Err(e)),
+                }
+            }
+            results
+        }
+    }
+
+    /// Test: Mock AI analyzer can process captures
+    #[tokio::test]
+    async fn test_mock_analyzer_processes_captures() {
+        let analyzer = MockActivityAnalyzer { should_fail: false };
+
+        let capture = CaptureForAnalysis {
+            id: 1,
+            timestamp: 1234567890,
+            file_path: "/test/capture.png".to_string(),
+        };
+
+        let result = analyzer.analyze(capture).await;
+        assert!(result.is_ok());
+
+        let analysis = result.unwrap();
+        assert_eq!(analysis.application_name, "MockApp_1");
+        assert_eq!(analysis.activity_description, "Mock activity description");
+        assert!(matches!(analysis.category, ActivityCategory::Coding));
+    }
+
+    /// Test: Mock AI analyzer failure handling
+    #[tokio::test]
+    async fn test_mock_analyzer_handles_failure() {
+        let analyzer = MockActivityAnalyzer { should_fail: true };
+
+        let capture = CaptureForAnalysis {
+            id: 1,
+            timestamp: 1234567890,
+            file_path: "/test/capture.png".to_string(),
+        };
+
+        let result = analyzer.analyze(capture).await;
+        assert!(result.is_err());
+    }
+
+    /// Test: Full analyze flow with mock (storage integration)
+    #[tokio::test]
+    async fn test_analyze_flow_with_mock_storage() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Create captures without activities (unanalyzed)
+        for i in 0..3 {
+            let capture = CaptureMetadata {
+                id: None,
+                timestamp: now - (i * 60),
+                file_path: format!("/test/analyze_{}.png", i),
+                created_at: now,
+            };
+            adapter.save_metadata(capture).await.unwrap();
+        }
+
+        // Verify unanalyzed captures exist
+        let unanalyzed = adapter.get_unanalyzed_capture_ids().await.unwrap();
+        assert_eq!(unanalyzed.len(), 3);
+
+        // Get capture metadata for analysis
+        let captures = adapter.get_recent_captures(10).await.unwrap();
+        let captures_for_analysis: Vec<CaptureForAnalysis> = captures
+            .into_iter()
+            .filter(|c| c.id.is_some())
+            .map(|c| CaptureForAnalysis {
+                id: c.id.unwrap(),
+                timestamp: c.timestamp,
+                file_path: c.file_path,
+            })
+            .collect();
+
+        // Simulate analyze flow using mock
+        let analyzer = MockActivityAnalyzer { should_fail: false };
+
+        for capture in captures_for_analysis {
+            let capture_id = capture.id;
+            let timestamp = capture.timestamp;
+
+            let result = analyzer.analyze(capture).await.unwrap();
+
+            let activity = Activity {
+                id: None,
+                capture_id,
+                timestamp,
+                application_name: result.application_name,
+                activity_description: result.activity_description,
+                category: result.category,
+                created_at: now,
+            };
+            adapter.save_activity(activity).await.unwrap();
+        }
+
+        // Verify all captures are now analyzed
+        let unanalyzed_after = adapter.get_unanalyzed_capture_ids().await.unwrap();
+        assert_eq!(unanalyzed_after.len(), 0);
+
+        // Verify activities were created
+        let activities = adapter
+            .get_activities_by_date_range(now - 86400, now + 86400)
+            .await
+            .unwrap();
+        assert_eq!(activities.len(), 3);
+    }
+
+    /// Test: Stats calculation with test data
+    #[tokio::test]
+    async fn test_activity_stats_calculation() {
+        let env = TestEnv::new();
+
+        let adapter = herald_adapters::SqliteAdapter::new(&env.db_path())
+            .await
+            .expect("Failed to create database");
+
+        setup_test_activities(&adapter).await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Get stats by application
+        let app_stats = adapter
+            .get_stats_by_application(now - 86400, now + 86400)
+            .await
+            .unwrap();
+
+        assert!(!app_stats.is_empty());
+        assert!(app_stats.iter().any(|s| s.application_name == "VS Code"));
+        assert!(app_stats.iter().any(|s| s.application_name == "Slack"));
+        assert!(app_stats.iter().any(|s| s.application_name == "Chrome"));
+
+        // Get stats by category
+        let cat_stats = adapter
+            .get_stats_by_category(now - 86400, now + 86400)
+            .await
+            .unwrap();
+
+        assert!(!cat_stats.is_empty());
+        assert!(cat_stats
+            .iter()
+            .any(|s| matches!(s.category, ActivityCategory::Coding)));
+        assert!(cat_stats
+            .iter()
+            .any(|s| matches!(s.category, ActivityCategory::Communication)));
     }
 }

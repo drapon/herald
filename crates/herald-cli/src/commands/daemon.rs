@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result};
 use herald_core::{
-    init_logger, load_config, CaptureScheduler, Config, DaemonController, DirectoryManager,
-    LogLevel, LoggerConfig, RetentionManager,
+    init_logger, load_config, ActivityAnalysisScheduler, CaptureScheduler, Config,
+    DaemonController, DirectoryManager, LogLevel, LoggerConfig, RetentionManager,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -98,6 +98,14 @@ pub async fn start() -> Result<()> {
         .context("Failed to start retention manager")?;
     tracing::info!("Retention manager started");
 
+    // Start activity analysis scheduler (if enabled)
+    let activity_scheduler_handle = if config.activity.enabled {
+        start_activity_scheduler(Arc::clone(&storage_adapter), Arc::clone(&config)).await
+    } else {
+        tracing::info!("Activity analysis is disabled in config");
+        None
+    };
+
     // Wait for shutdown signal
     let mut shutdown_rx = daemon_result.shutdown_rx;
     tokio::select! {
@@ -120,6 +128,12 @@ pub async fn start() -> Result<()> {
     tracing::info!("Stopping retention manager...");
     if let Err(e) = retention_manager.stop().await {
         tracing::warn!("Error stopping retention manager: {}", e);
+    }
+
+    // Stop activity scheduler if it was started
+    if let Some(handle) = activity_scheduler_handle {
+        tracing::info!("Stopping activity analysis scheduler...");
+        stop_activity_scheduler(handle).await;
     }
 
     // Clean up PID file
@@ -160,6 +174,132 @@ pub async fn stop() -> Result<()> {
             Ok(())
         }
         Err(e) => Err(e).context("Failed to stop daemon"),
+    }
+}
+
+// ============================================================================
+// Activity Scheduler Helpers
+// ============================================================================
+
+/// Handle for a running activity scheduler (type-erased)
+enum ActivitySchedulerHandle {
+    Claude(
+        ActivityAnalysisScheduler<
+            herald_adapters::AIActivityAnalyzer<herald_adapters::ClaudeAdapter>,
+            herald_adapters::SqliteAdapter,
+        >,
+    ),
+    Gemini(
+        ActivityAnalysisScheduler<
+            herald_adapters::AIActivityAnalyzer<herald_adapters::GeminiAdapter>,
+            herald_adapters::SqliteAdapter,
+        >,
+    ),
+}
+
+/// Get API key from config or environment variable
+fn get_api_key(config: &Config, env_var_name: &str) -> Option<String> {
+    // First, try to get from config
+    if let Some(ref key) = config.ai.api_key {
+        if !key.is_empty() {
+            return Some(key.clone());
+        }
+    }
+
+    // Fallback to environment variable
+    std::env::var(env_var_name).ok()
+}
+
+/// Start the activity analysis scheduler based on configuration
+async fn start_activity_scheduler(
+    storage: Arc<herald_adapters::SqliteAdapter>,
+    config: Arc<Config>,
+) -> Option<ActivitySchedulerHandle> {
+    // Try to get API key and create scheduler based on provider
+    match config.ai.default_provider.as_str() {
+        "gemini" => {
+            let api_key = match get_api_key(&config, "GEMINI_API_KEY") {
+                Some(key) => key,
+                None => {
+                    tracing::warn!(
+                        "Gemini API key not set (config.ai.api_key or GEMINI_API_KEY), activity analysis disabled"
+                    );
+                    return None;
+                }
+            };
+
+            let provider = Arc::new(herald_adapters::GeminiAdapter::new(
+                api_key,
+                config.ai.model.clone(),
+            ));
+            let analyzer = Arc::new(herald_adapters::AIActivityAnalyzer::new(provider));
+            let scheduler = ActivityAnalysisScheduler::new(analyzer, storage, Arc::clone(&config));
+
+            match scheduler.start().await {
+                Ok(()) => {
+                    println!(
+                        "Activity analysis enabled (interval: {} seconds)",
+                        config.activity.analyze_interval_seconds
+                    );
+                    tracing::info!("Activity analysis scheduler started with Gemini");
+                    Some(ActivitySchedulerHandle::Gemini(scheduler))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start activity scheduler: {}", e);
+                    None
+                }
+            }
+        }
+        _ => {
+            // Default to Claude
+            let api_key = match get_api_key(&config, "ANTHROPIC_API_KEY") {
+                Some(key) => key,
+                None => {
+                    tracing::warn!(
+                        "Claude API key not set (config.ai.api_key or ANTHROPIC_API_KEY), activity analysis disabled"
+                    );
+                    return None;
+                }
+            };
+
+            let provider = Arc::new(herald_adapters::ClaudeAdapter::new(
+                api_key,
+                config.ai.model.clone(),
+            ));
+            let analyzer = Arc::new(herald_adapters::AIActivityAnalyzer::new(provider));
+            let scheduler = ActivityAnalysisScheduler::new(analyzer, storage, Arc::clone(&config));
+
+            match scheduler.start().await {
+                Ok(()) => {
+                    println!(
+                        "Activity analysis enabled (interval: {} seconds)",
+                        config.activity.analyze_interval_seconds
+                    );
+                    tracing::info!("Activity analysis scheduler started with Claude");
+                    Some(ActivitySchedulerHandle::Claude(scheduler))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start activity scheduler: {}", e);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Stop the activity analysis scheduler
+async fn stop_activity_scheduler(handle: ActivitySchedulerHandle) {
+    match handle {
+        ActivitySchedulerHandle::Claude(scheduler) => {
+            if let Err(e) = scheduler.stop().await {
+                tracing::warn!("Error stopping Claude activity scheduler: {}", e);
+            }
+        }
+        ActivitySchedulerHandle::Gemini(scheduler) => {
+            if let Err(e) = scheduler.stop().await {
+                tracing::warn!("Error stopping Gemini activity scheduler: {}", e);
+            }
+        }
     }
 }
 

@@ -38,6 +38,9 @@ base64.workspace = true
 rusqlite.workspace = true
 tokio-rusqlite.workspace = true
 
+# Date/time
+chrono.workspace = true
+
 # Screen capture (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit.workspace = true

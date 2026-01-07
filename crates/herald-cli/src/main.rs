@@ -24,6 +24,11 @@ struct Cli {
 /// Available subcommands
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Manage activity records and analysis
+    Activity {
+        #[command(subcommand)]
+        action: commands::activity::ActivityAction,
+    },
     /// Manage the Herald daemon (background service)
     Daemon {
         #[command(subcommand)]
@@ -56,6 +61,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Activity { action }) => commands::activity::run(action).await,
         Some(Commands::Daemon { action }) => match action {
             DaemonAction::Start => commands::daemon::start().await,
             DaemonAction::Stop => commands::daemon::stop().await,

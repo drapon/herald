@@ -3,11 +3,13 @@
 //! This crate contains concrete implementations of the ports defined in herald-core,
 //! including ScreenCaptureKit integration, SQLite storage, and AI provider clients.
 
+pub mod activity_analyzer;
 pub mod ai;
 pub mod capture;
 pub mod storage;
 
 // Re-export primary adapter types
+pub use activity_analyzer::AIActivityAnalyzer;
 pub use ai::{ClaudeAdapter, GeminiAdapter};
 pub use storage::SqliteAdapter;
 

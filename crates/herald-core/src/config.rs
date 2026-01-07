@@ -21,6 +21,10 @@ pub struct Config {
     /// AI provider settings
     #[serde(default)]
     pub ai: AiConfig,
+
+    /// Activity analysis settings
+    #[serde(default)]
+    pub activity: ActivityConfig,
 }
 
 impl Default for Config {
@@ -29,6 +33,7 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             storage: StorageConfig::default(),
             ai: AiConfig::default(),
+            activity: ActivityConfig::default(),
         }
     }
 }
@@ -109,6 +114,11 @@ pub struct AiConfig {
     /// Model name to use
     #[serde(default = "default_model")]
     pub model: String,
+
+    /// API key for the AI provider
+    /// If not set, falls back to environment variables (ANTHROPIC_API_KEY or GEMINI_API_KEY)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 impl Default for AiConfig {
@@ -116,6 +126,28 @@ impl Default for AiConfig {
         Self {
             default_provider: default_provider(),
             model: default_model(),
+            api_key: None,
+        }
+    }
+}
+
+/// Activity analysis configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActivityConfig {
+    /// Enable automatic activity analysis (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Analysis interval in seconds (default: 300 = 5 minutes)
+    #[serde(default = "default_analyze_interval")]
+    pub analyze_interval_seconds: u64,
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            analyze_interval_seconds: default_analyze_interval(),
         }
     }
 }
@@ -145,6 +177,10 @@ fn default_provider() -> String {
 
 fn default_model() -> String {
     "claude-3-5-sonnet-20241022".to_string()
+}
+
+fn default_analyze_interval() -> u64 {
+    300 // 5 minutes
 }
 
 /// Expands tilde (~) in a path to the home directory
@@ -202,6 +238,12 @@ impl Config {
         if !["claude", "gemini"].contains(&self.ai.default_provider.as_str()) {
             return Err(ConfigError::InvalidValue(
                 "default_provider must be 'claude' or 'gemini'".to_string(),
+            ));
+        }
+
+        if self.activity.enabled && self.activity.analyze_interval_seconds == 0 {
+            return Err(ConfigError::InvalidValue(
+                "analyze_interval_seconds must be > 0 when activity is enabled".to_string(),
             ));
         }
 
@@ -641,5 +683,115 @@ default_provider = "claude"
         assert_eq!(config.capture.interval_seconds, 60);
         assert_eq!(config.capture.image_quality, 6);
         assert!(config.capture.display.is_none());
+    }
+
+    // === ActivityConfig Tests ===
+
+    #[test]
+    fn test_activity_config_default() {
+        let config = ActivityConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.analyze_interval_seconds, 300);
+    }
+
+    #[test]
+    fn test_activity_config_in_main_config() {
+        let config = Config::default();
+        assert!(!config.activity.enabled);
+        assert_eq!(config.activity.analyze_interval_seconds, 300);
+    }
+
+    #[test]
+    fn test_activity_config_deserialization() {
+        let toml_str = r#"
+[activity]
+enabled = true
+analyze_interval_seconds = 600
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert!(config.activity.enabled);
+        assert_eq!(config.activity.analyze_interval_seconds, 600);
+    }
+
+    #[test]
+    fn test_activity_config_partial_uses_defaults() {
+        let toml_str = r#"
+[activity]
+enabled = true
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert!(config.activity.enabled);
+        assert_eq!(config.activity.analyze_interval_seconds, 300);
+    }
+
+    #[test]
+    fn test_activity_config_omitted_uses_defaults() {
+        let toml_str = r#"
+[capture]
+interval_seconds = 30
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert!(!config.activity.enabled);
+        assert_eq!(config.activity.analyze_interval_seconds, 300);
+    }
+
+    #[test]
+    fn test_activity_config_serialization() {
+        let mut config = Config::default();
+        config.activity.enabled = true;
+        config.activity.analyze_interval_seconds = 600;
+        let toml_str = toml::to_string(&config).expect("Failed to serialize");
+        assert!(toml_str.contains("[activity]"));
+        assert!(toml_str.contains("enabled = true"));
+        assert!(toml_str.contains("analyze_interval_seconds = 600"));
+    }
+
+    #[test]
+    fn test_activity_config_validation_enabled_with_zero_interval_fails() {
+        let mut config = Config::default();
+        config.activity.enabled = true;
+        config.activity.analyze_interval_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("analyze_interval_seconds"));
+    }
+
+    #[test]
+    fn test_activity_config_validation_disabled_with_zero_interval_ok() {
+        let mut config = Config::default();
+        config.activity.enabled = false;
+        config.activity.analyze_interval_seconds = 0;
+        // Should be OK because activity is disabled
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_activity_config_validation_valid() {
+        let mut config = Config::default();
+        config.activity.enabled = true;
+        config.activity.analyze_interval_seconds = 300;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_backward_compatibility_no_activity_section() {
+        // Old config files without activity section should still work
+        let toml_str = r#"
+[capture]
+interval_seconds = 60
+
+[storage]
+retention_seconds = 86400
+
+[ai]
+default_provider = "claude"
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        // Activity should use defaults
+        assert!(!config.activity.enabled);
+        assert_eq!(config.activity.analyze_interval_seconds, 300);
     }
 }
