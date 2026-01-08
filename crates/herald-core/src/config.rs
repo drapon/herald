@@ -6,6 +6,8 @@ use crate::error::ConfigError;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Main configuration structure for Herald
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25,6 +27,10 @@ pub struct Config {
     /// Activity analysis settings
     #[serde(default)]
     pub activity: ActivityConfig,
+
+    /// MTG (Meeting) recording settings
+    #[serde(default)]
+    pub mtg: MtgConfig,
 }
 
 impl Default for Config {
@@ -34,6 +40,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             ai: AiConfig::default(),
             activity: ActivityConfig::default(),
+            mtg: MtgConfig::default(),
         }
     }
 }
@@ -152,6 +159,75 @@ impl Default for ActivityConfig {
     }
 }
 
+/// MTG (Meeting) recording configuration
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct MtgConfig {
+    /// List of meeting app process names to monitor
+    #[serde(default = "default_watched_apps")]
+    pub watched_apps: Vec<String>,
+
+    /// Silence detection timeout in seconds for browser meeting fallback (default: 180 = 3 minutes)
+    #[serde(default = "default_silence_timeout_seconds")]
+    pub silence_timeout_seconds: u64,
+
+    /// Maximum recording duration in seconds (default: 14400 = 4 hours)
+    #[serde(default = "default_max_recording_seconds")]
+    pub max_recording_seconds: u64,
+
+    /// Capture interval during MTG mode in seconds (default: 10)
+    #[serde(default = "default_mtg_capture_interval_seconds")]
+    pub mtg_capture_interval_seconds: u64,
+}
+
+impl Default for MtgConfig {
+    fn default() -> Self {
+        Self {
+            watched_apps: default_watched_apps(),
+            silence_timeout_seconds: default_silence_timeout_seconds(),
+            max_recording_seconds: default_max_recording_seconds(),
+            mtg_capture_interval_seconds: default_mtg_capture_interval_seconds(),
+        }
+    }
+}
+
+impl MtgConfig {
+    /// Validates the MTG configuration values
+    ///
+    /// # Errors
+    /// Returns `ConfigError::InvalidValue` if:
+    /// - `watched_apps` is empty
+    /// - `silence_timeout_seconds` is 0
+    /// - `max_recording_seconds` is 0
+    /// - `mtg_capture_interval_seconds` is 0
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.watched_apps.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "mtg.watched_apps must not be empty".to_string(),
+            ));
+        }
+
+        if self.silence_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidValue(
+                "mtg.silence_timeout_seconds must be > 0".to_string(),
+            ));
+        }
+
+        if self.max_recording_seconds == 0 {
+            return Err(ConfigError::InvalidValue(
+                "mtg.max_recording_seconds must be > 0".to_string(),
+            ));
+        }
+
+        if self.mtg_capture_interval_seconds == 0 {
+            return Err(ConfigError::InvalidValue(
+                "mtg.mtg_capture_interval_seconds must be > 0".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 // Default value functions
 fn default_interval_seconds() -> u64 {
     60
@@ -181,6 +257,28 @@ fn default_model() -> String {
 
 fn default_analyze_interval() -> u64 {
     300 // 5 minutes
+}
+
+fn default_watched_apps() -> Vec<String> {
+    vec![
+        "zoom.us".to_string(),
+        "Microsoft Teams".to_string(),
+        "Discord".to_string(),
+        "Slack".to_string(),
+        "Webex".to_string(),
+    ]
+}
+
+fn default_silence_timeout_seconds() -> u64 {
+    180 // 3 minutes
+}
+
+fn default_max_recording_seconds() -> u64 {
+    14400 // 4 hours
+}
+
+fn default_mtg_capture_interval_seconds() -> u64 {
+    10
 }
 
 /// Expands tilde (~) in a path to the home directory
@@ -246,6 +344,9 @@ impl Config {
                 "analyze_interval_seconds must be > 0 when activity is enabled".to_string(),
             ));
         }
+
+        // Validate MTG config
+        self.mtg.validate()?;
 
         Ok(())
     }
@@ -321,6 +422,115 @@ pub fn load_config_from_path(path: &Path) -> Result<Config, ConfigError> {
 /// Convenience wrapper around `load_config_from_path`.
 pub fn load_config() -> Result<Config, ConfigError> {
     load_config_from_path(&get_default_config_path())
+}
+
+/// Configuration provider with hot-reload support
+///
+/// This struct wraps a configuration and provides thread-safe access
+/// with the ability to reload the configuration from file without
+/// restarting the daemon.
+#[derive(Debug)]
+pub struct ConfigProvider {
+    config: Arc<RwLock<Config>>,
+    config_path: PathBuf,
+}
+
+impl ConfigProvider {
+    /// Creates a new ConfigProvider with the given configuration and path
+    ///
+    /// # Arguments
+    /// * `config` - Initial configuration
+    /// * `config_path` - Path to the configuration file for reloading
+    pub fn new(config: Config, config_path: PathBuf) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            config_path,
+        }
+    }
+
+    /// Creates a new ConfigProvider from the default config path
+    ///
+    /// Loads configuration from `~/.herald/config.toml`
+    pub fn from_default_path() -> Result<Self, ConfigError> {
+        let path = get_default_config_path();
+        let config = load_config_from_path(&path)?;
+        Ok(Self::new(config, path))
+    }
+
+    /// Creates a new ConfigProvider from a specific path
+    pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
+        let config = load_config_from_path(path)?;
+        Ok(Self::new(config, path.to_path_buf()))
+    }
+
+    /// Returns a clone of the current configuration
+    ///
+    /// This is useful when you need an owned copy of the configuration
+    pub async fn get(&self) -> Config {
+        self.config.read().await.clone()
+    }
+
+    /// Returns the inner Arc<RwLock<Config>> for direct access
+    ///
+    /// This is useful when you need to share the config across multiple tasks
+    pub fn shared(&self) -> Arc<RwLock<Config>> {
+        Arc::clone(&self.config)
+    }
+
+    /// Reloads the configuration from the file
+    ///
+    /// If the file cannot be read or contains invalid configuration,
+    /// the current configuration is kept and an error is returned.
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Configuration was reloaded successfully
+    /// * `Ok(false)` - Configuration file hasn't changed (same content)
+    /// * `Err(_)` - Failed to reload (current config is preserved)
+    pub async fn reload(&self) -> Result<bool, ConfigError> {
+        // Read the file
+        let content = fs::read_to_string(&self.config_path)?;
+
+        // Parse TOML
+        let new_config: Config = toml::from_str(&content)
+            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+
+        // Validate configuration
+        new_config.validate()?;
+
+        // Check if config actually changed
+        let current_config = self.config.read().await;
+        let current_toml = toml::to_string(&*current_config)
+            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let new_toml = toml::to_string(&new_config)
+            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+
+        if current_toml == new_toml {
+            tracing::debug!("Configuration unchanged, skipping reload");
+            return Ok(false);
+        }
+        drop(current_config);
+
+        // Update the configuration
+        let mut config = self.config.write().await;
+        *config = new_config;
+
+        tracing::info!("Configuration reloaded from {:?}", self.config_path);
+        Ok(true)
+    }
+
+    /// Returns the path to the configuration file
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+}
+
+impl Clone for ConfigProvider {
+    fn clone(&self) -> Self {
+        Self {
+            config: Arc::clone(&self.config),
+            config_path: self.config_path.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -793,5 +1003,450 @@ default_provider = "claude"
         // Activity should use defaults
         assert!(!config.activity.enabled);
         assert_eq!(config.activity.analyze_interval_seconds, 300);
+    }
+
+    // === MtgConfig Tests ===
+
+    #[test]
+    fn test_mtg_config_default() {
+        let config = MtgConfig::default();
+        assert_eq!(
+            config.watched_apps,
+            vec![
+                "zoom.us".to_string(),
+                "Microsoft Teams".to_string(),
+                "Discord".to_string(),
+                "Slack".to_string(),
+                "Webex".to_string(),
+            ]
+        );
+        assert_eq!(config.silence_timeout_seconds, 180);
+        assert_eq!(config.max_recording_seconds, 14400);
+        assert_eq!(config.mtg_capture_interval_seconds, 10);
+    }
+
+    #[test]
+    fn test_mtg_config_validation_valid() {
+        let config = MtgConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mtg_config_validation_empty_watched_apps_fails() {
+        let mut config = MtgConfig::default();
+        config.watched_apps = vec![];
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("watched_apps"));
+    }
+
+    #[test]
+    fn test_mtg_config_validation_zero_silence_timeout_fails() {
+        let mut config = MtgConfig::default();
+        config.silence_timeout_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("silence_timeout_seconds"));
+    }
+
+    #[test]
+    fn test_mtg_config_validation_zero_max_recording_fails() {
+        let mut config = MtgConfig::default();
+        config.max_recording_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("max_recording_seconds"));
+    }
+
+    #[test]
+    fn test_mtg_config_validation_zero_capture_interval_fails() {
+        let mut config = MtgConfig::default();
+        config.mtg_capture_interval_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mtg_capture_interval_seconds"));
+    }
+
+    #[test]
+    fn test_mtg_config_deserialization() {
+        let toml_str = r#"
+watched_apps = ["zoom.us", "Slack"]
+silence_timeout_seconds = 300
+max_recording_seconds = 7200
+mtg_capture_interval_seconds = 5
+"#;
+        let config: MtgConfig = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.watched_apps, vec!["zoom.us", "Slack"]);
+        assert_eq!(config.silence_timeout_seconds, 300);
+        assert_eq!(config.max_recording_seconds, 7200);
+        assert_eq!(config.mtg_capture_interval_seconds, 5);
+    }
+
+    #[test]
+    fn test_mtg_config_partial_uses_defaults() {
+        let toml_str = r#"
+watched_apps = ["zoom.us"]
+"#;
+        let config: MtgConfig = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.watched_apps, vec!["zoom.us"]);
+        // Other values should use defaults
+        assert_eq!(config.silence_timeout_seconds, 180);
+        assert_eq!(config.max_recording_seconds, 14400);
+        assert_eq!(config.mtg_capture_interval_seconds, 10);
+    }
+
+    #[test]
+    fn test_mtg_config_serialization() {
+        let config = MtgConfig::default();
+        let toml_str = toml::to_string(&config).expect("Failed to serialize");
+        assert!(toml_str.contains("watched_apps"));
+        assert!(toml_str.contains("zoom.us"));
+        assert!(toml_str.contains("silence_timeout_seconds = 180"));
+        assert!(toml_str.contains("max_recording_seconds = 14400"));
+        assert!(toml_str.contains("mtg_capture_interval_seconds = 10"));
+    }
+
+    // === Config with MTG Integration Tests ===
+
+    #[test]
+    fn test_config_includes_mtg_defaults() {
+        let config = Config::default();
+        assert_eq!(config.mtg.watched_apps.len(), 5);
+        assert_eq!(config.mtg.silence_timeout_seconds, 180);
+        assert_eq!(config.mtg.max_recording_seconds, 14400);
+        assert_eq!(config.mtg.mtg_capture_interval_seconds, 10);
+    }
+
+    #[test]
+    fn test_config_mtg_section_deserialization() {
+        let toml_str = r#"
+[capture]
+interval_seconds = 60
+
+[mtg]
+watched_apps = ["zoom.us", "Teams"]
+silence_timeout_seconds = 300
+max_recording_seconds = 7200
+mtg_capture_interval_seconds = 5
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.capture.interval_seconds, 60);
+        assert_eq!(config.mtg.watched_apps, vec!["zoom.us", "Teams"]);
+        assert_eq!(config.mtg.silence_timeout_seconds, 300);
+        assert_eq!(config.mtg.max_recording_seconds, 7200);
+        assert_eq!(config.mtg.mtg_capture_interval_seconds, 5);
+    }
+
+    #[test]
+    fn test_config_mtg_section_partial_uses_defaults() {
+        let toml_str = r#"
+[mtg]
+watched_apps = ["zoom.us"]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.mtg.watched_apps, vec!["zoom.us"]);
+        assert_eq!(config.mtg.silence_timeout_seconds, 180);
+        assert_eq!(config.mtg.max_recording_seconds, 14400);
+        assert_eq!(config.mtg.mtg_capture_interval_seconds, 10);
+    }
+
+    #[test]
+    fn test_config_without_mtg_section_uses_defaults() {
+        let toml_str = r#"
+[capture]
+interval_seconds = 60
+
+[ai]
+default_provider = "claude"
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        // MTG should use all defaults
+        assert_eq!(config.mtg.watched_apps.len(), 5);
+        assert!(config.mtg.watched_apps.contains(&"zoom.us".to_string()));
+        assert_eq!(config.mtg.silence_timeout_seconds, 180);
+    }
+
+    #[test]
+    fn test_config_validation_includes_mtg_validation() {
+        let mut config = Config::default();
+        config.mtg.watched_apps = vec![]; // Invalid: empty
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("watched_apps"));
+    }
+
+    #[test]
+    fn test_config_validation_mtg_zero_values_fail() {
+        let mut config = Config::default();
+        config.mtg.silence_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.mtg.max_recording_seconds = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.mtg.mtg_capture_interval_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_mtg_uses_storage_data_dir() {
+        // Verify that storage.data_dir is accessible for MTG recordings
+        let toml_str = r#"
+[storage]
+data_dir = "/custom/data/path"
+
+[mtg]
+watched_apps = ["zoom.us"]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse");
+        assert_eq!(config.storage.data_dir, PathBuf::from("/custom/data/path"));
+        // MTG recordings should use storage.data_dir
+        assert_eq!(config.mtg.watched_apps, vec!["zoom.us"]);
+    }
+
+    #[test]
+    fn test_load_config_with_invalid_mtg_returns_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Create config with invalid MTG values
+        let invalid_config = r#"
+[mtg]
+watched_apps = []
+"#;
+        fs::write(&config_path, invalid_config).unwrap();
+
+        // Should return default config when validation fails
+        let config = load_config_from_path(&config_path).unwrap();
+        // Should have default watched_apps since validation failed
+        assert_eq!(config.mtg.watched_apps.len(), 5);
+    }
+
+    // === ConfigProvider Tests ===
+
+    #[tokio::test]
+    async fn test_config_provider_new() {
+        let config = Config::default();
+        let provider = ConfigProvider::new(config.clone(), PathBuf::from("/test/config.toml"));
+
+        let retrieved = provider.get().await;
+        assert_eq!(retrieved.capture.interval_seconds, config.capture.interval_seconds);
+        assert_eq!(provider.config_path(), Path::new("/test/config.toml"));
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_from_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        let custom_config = r#"
+[capture]
+interval_seconds = 120
+
+[mtg]
+watched_apps = ["zoom.us", "Teams"]
+"#;
+        fs::write(&config_path, custom_config).unwrap();
+
+        let provider = ConfigProvider::from_path(&config_path).unwrap();
+        let config = provider.get().await;
+
+        assert_eq!(config.capture.interval_seconds, 120);
+        assert_eq!(config.mtg.watched_apps, vec!["zoom.us", "Teams"]);
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_reload_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Initial config
+        let initial_config = r#"
+[capture]
+interval_seconds = 60
+"#;
+        fs::write(&config_path, initial_config).unwrap();
+
+        let provider = ConfigProvider::from_path(&config_path).unwrap();
+        assert_eq!(provider.get().await.capture.interval_seconds, 60);
+
+        // Update config file
+        let updated_config = r#"
+[capture]
+interval_seconds = 120
+"#;
+        fs::write(&config_path, updated_config).unwrap();
+
+        // Reload
+        let result = provider.reload().await;
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // true = config changed
+
+        // Verify new config
+        assert_eq!(provider.get().await.capture.interval_seconds, 120);
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_reload_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        let config_content = r#"
+[capture]
+interval_seconds = 60
+"#;
+        fs::write(&config_path, config_content).unwrap();
+
+        let provider = ConfigProvider::from_path(&config_path).unwrap();
+
+        // Reload without changes
+        let result = provider.reload().await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // false = config unchanged
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_reload_invalid_keeps_old_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Initial valid config
+        let initial_config = r#"
+[capture]
+interval_seconds = 60
+"#;
+        fs::write(&config_path, initial_config).unwrap();
+
+        let provider = ConfigProvider::from_path(&config_path).unwrap();
+        assert_eq!(provider.get().await.capture.interval_seconds, 60);
+
+        // Update with invalid config
+        let invalid_config = r#"
+[capture]
+interval_seconds = 0
+"#;
+        fs::write(&config_path, invalid_config).unwrap();
+
+        // Reload should fail
+        let result = provider.reload().await;
+        assert!(result.is_err());
+
+        // Old config should be preserved
+        assert_eq!(provider.get().await.capture.interval_seconds, 60);
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_reload_parse_error_keeps_old_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Initial valid config
+        let initial_config = r#"
+[capture]
+interval_seconds = 60
+"#;
+        fs::write(&config_path, initial_config).unwrap();
+
+        let provider = ConfigProvider::from_path(&config_path).unwrap();
+
+        // Update with invalid TOML
+        fs::write(&config_path, "invalid { toml [[[").unwrap();
+
+        // Reload should fail
+        let result = provider.reload().await;
+        assert!(result.is_err());
+
+        // Old config should be preserved
+        assert_eq!(provider.get().await.capture.interval_seconds, 60);
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_shared() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        let config_content = r#"
+[capture]
+interval_seconds = 60
+"#;
+        fs::write(&config_path, config_content).unwrap();
+
+        let provider = ConfigProvider::from_path(&config_path).unwrap();
+        let shared = provider.shared();
+
+        // Access via shared Arc
+        let config = shared.read().await;
+        assert_eq!(config.capture.interval_seconds, 60);
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_clone_shares_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        let initial_config = r#"
+[capture]
+interval_seconds = 60
+"#;
+        fs::write(&config_path, initial_config).unwrap();
+
+        let provider1 = ConfigProvider::from_path(&config_path).unwrap();
+        let provider2 = provider1.clone();
+
+        // Update config file
+        let updated_config = r#"
+[capture]
+interval_seconds = 120
+"#;
+        fs::write(&config_path, updated_config).unwrap();
+
+        // Reload via provider1
+        provider1.reload().await.unwrap();
+
+        // provider2 should see the updated config (shared state)
+        assert_eq!(provider2.get().await.capture.interval_seconds, 120);
+    }
+
+    #[tokio::test]
+    async fn test_config_provider_reload_mtg_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Initial config with default MTG
+        let initial_config = r#"
+[mtg]
+watched_apps = ["zoom.us"]
+silence_timeout_seconds = 180
+"#;
+        fs::write(&config_path, initial_config).unwrap();
+
+        let provider = ConfigProvider::from_path(&config_path).unwrap();
+        assert_eq!(provider.get().await.mtg.silence_timeout_seconds, 180);
+
+        // Update MTG config
+        let updated_config = r#"
+[mtg]
+watched_apps = ["zoom.us", "Teams"]
+silence_timeout_seconds = 300
+"#;
+        fs::write(&config_path, updated_config).unwrap();
+
+        // Reload
+        provider.reload().await.unwrap();
+
+        let config = provider.get().await;
+        assert_eq!(config.mtg.watched_apps, vec!["zoom.us", "Teams"]);
+        assert_eq!(config.mtg.silence_timeout_seconds, 300);
     }
 }

@@ -25,7 +25,7 @@ pub use api_key::{
 };
 pub use config::{
     get_default_config_path, load_config, load_config_from_path, AiConfig, CaptureConfig, Config,
-    StorageConfig,
+    ConfigProvider, MtgConfig, StorageConfig,
 };
 pub use daemon::{DaemonController, DaemonError, DaemonStartResult, PidManager, ShutdownSender};
 pub use directory::DirectoryManager;
